@@ -28,9 +28,12 @@ from datetime import datetime, timezone, timedelta
 import requests
 
 try:
-    # Optional: load a local .env if python-dotenv is installed.
+    # Optional: load a local .env if python-dotenv is installed. Resolve it
+    # relative to THIS file, not the current working directory — otherwise the
+    # scraper launched from anywhere else won't find it, GIST_ID comes back
+    # empty, and every run creates a brand-new gist.
     from dotenv import load_dotenv
-    load_dotenv()
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 except Exception:
     pass
 
@@ -399,6 +402,35 @@ def build_feed_payload(store):
 # Publishing to GitHub Gist (free, viewable anywhere)
 # ----------------------------------------------------------------------------
 
+def _persist_gist_id(gist_id):
+    """
+    Remember a freshly-created gist id so later cycles (and future runs) reuse
+    it instead of creating yet another gist. Updates the in-memory GIST_ID and
+    writes it back into the project's .env.
+    """
+    global GIST_ID
+    GIST_ID = gist_id
+
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        lines = []
+        if os.path.exists(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+
+        for i, line in enumerate(lines):
+            if line.strip().startswith("GIST_ID="):
+                lines[i] = f"GIST_ID={gist_id}"
+                break
+        else:
+            lines.append(f"GIST_ID={gist_id}")
+
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError:
+        pass  # in-memory update still prevents repeat creation this run
+
+
 def publish_to_gist(payload_json, log=print):
     """
     Push the feed to a secret GitHub Gist.
@@ -434,10 +466,11 @@ def publish_to_gist(payload_json, log=print):
         if resp.status_code in (200, 201):
             gist_id = resp.json().get("id")
             if not GIST_ID:
+                _persist_gist_id(gist_id)  # so we don't spawn another next cycle
                 log("=" * 60)
-                log(f"  NEW GIST CREATED. Add this to your .env:")
+                log("  NEW GIST CREATED — saved to .env as GIST_ID.")
                 log(f"  GIST_ID={gist_id}")
-                log(f"  Paste the SAME id into the app's Snipe settings.")
+                log("  Paste this SAME id into the app's Snipe settings.")
                 log("=" * 60)
             else:
                 log(f"--> Published {GIST_FILENAME} to gist {gist_id}.")

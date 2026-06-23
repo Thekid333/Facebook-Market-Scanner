@@ -20,6 +20,7 @@ and publishing logic lives in exactly one place.
 
 import json
 import os
+import random
 import re
 import time
 from datetime import datetime, timezone, timedelta
@@ -43,6 +44,27 @@ LEGACY_SEEN_FILE = "seen_couches.json"    # Old format: a flat list of seen ids
 
 # How long a listing stays in the published feed before it is pruned out.
 RETENTION_DAYS = int(os.getenv("LISTING_RETENTION_DAYS", "7"))
+
+# Relevance filtering (keeps the feed clean for every device that reads it).
+#
+# A listing is discarded if its title contains any REJECT_KEYWORD, or if it
+# mentions none of the keywords implied by the search it came from. The reject
+# list defaults to "repair", which knocks out the "Washer Repair Services"
+# business posts. (Tighten to "repair service" if you'd rather keep listings
+# whose title merely says "needs repair".)
+REJECT_KEYWORDS = [
+    kw.strip().lower()
+    for kw in os.getenv("LISTING_REJECT_KEYWORDS", "repair").split(",")
+    if kw.strip()
+]
+
+# Words stripped from a search name before deriving its required keywords, so
+# "Washer and Dryer" requires {washer, dryer} rather than also requiring "and".
+QUERY_STOPWORDS = {"and", "or", "the", "a", "with", "for", "of", "in", "set", "&"}
+
+# Most item pages to open per scan when fetching real listed times. Keeps the
+# extra navigation (and bot-detection risk) bounded on a big first batch.
+DETAIL_FETCH_CAP = int(os.getenv("LISTING_DETAIL_FETCH_CAP", "15"))
 
 # GitHub Gist publishing (the free "view anywhere" bridge to the app)
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
@@ -85,6 +107,43 @@ def _price_to_value(price_text):
         return 0
     digits = re.sub(r"[^\d]", "", price_text)
     return int(digits) if digits else None
+
+
+# Crude stem so a "Washer and Dryer" search still matches "washing machine":
+# washer -> wash, dryer -> dry, couches -> couch.
+def _stem(word):
+    for suffix in ("ers", "ing", "er", "es", "s"):
+        if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+            return word[: -len(suffix)]
+    return word
+
+
+# "Washer and Dryer" -> {"wash", "dry"}: stemmed words >= 3 chars, minus stopwords.
+# A title matches if it contains any of these as a substring.
+def _required_tokens(category):
+    if not category:
+        return set()
+    words = re.split(r"[^a-z]+", category.lower())
+    return {_stem(w) for w in words if len(w) >= 3 and w not in QUERY_STOPWORDS}
+
+
+def is_relevant(record):
+    """
+    True if this listing should appear in the feed.
+
+    Discards repair/service business posts (title contains a REJECT_KEYWORD) and
+    off-topic items that mention none of the search's keywords (e.g. a fridge
+    surfacing under a "Washer and Dryer" search).
+    """
+    title = (record.get("title") or "").lower()
+    if any(bad in title for bad in REJECT_KEYWORDS):
+        return False
+
+    required = _required_tokens(record.get("category"))
+    if required and not any(tok in title for tok in required):
+        return False
+
+    return True
 
 
 def parse_listing(link, search_name):
@@ -135,7 +194,7 @@ def parse_listing(link, search_name):
 
     clean_href = href if href.startswith("http") else f"https://www.facebook.com{href}"
 
-    return {
+    record = {
         "id": item_id,
         "title": title,
         "price": price,
@@ -147,7 +206,103 @@ def parse_listing(link, search_name):
         "url": clean_href,
         "category": search_name,
         # first_seen is stamped by the store when the item is first recorded.
+        # listed_at is filled in later from the item's own page, if available.
     }
+
+    # Drop repair/service spam and off-topic items before they ever hit the store.
+    if not is_relevant(record):
+        return None
+
+    return record
+
+
+# ----------------------------------------------------------------------------
+# Listed time (parsed from an item's own detail page)
+# ----------------------------------------------------------------------------
+
+# FB embeds the listing's creation time in inline JSON, e.g. "creation_time":1718...
+# (sometimes backslash-escaped). 10 digits = seconds, 13 = milliseconds.
+_CREATION_TIME_RE = re.compile(r'\\?"creation_time\\?"\s*:\s*(\d{10,13})')
+
+# Visible fallback text on the page, e.g. "Listed about an hour ago", "Listed 3 days ago".
+_LISTED_AGO_RE = re.compile(
+    r"Listed\s+(?:about\s+|over\s+)?(\d+|a|an)\s+(minute|hour|day|week|month)s?\s+ago",
+    re.IGNORECASE,
+)
+_LISTED_SPECIAL_RE = re.compile(r"Listed\s+(just now|yesterday|a few seconds ago)", re.IGNORECASE)
+
+_AGO_UNIT_SECONDS = {
+    "minute": 60,
+    "hour": 3600,
+    "day": 86400,
+    "week": 604800,
+    "month": 2592000,  # ~30 days, good enough for a relative label
+}
+
+
+def parse_listed_time(html):
+    """
+    Extract when a listing was actually posted from its detail-page HTML.
+
+    Returns an ISO-8601 UTC string (same shape as _iso_now), or None if the page
+    didn't expose a usable time. Best-effort: FB markup shifts, so this falls
+    back from the embedded epoch to the visible "Listed ... ago" text.
+    """
+    if not html:
+        return None
+
+    match = _CREATION_TIME_RE.search(html)
+    if match:
+        raw = int(match.group(1))
+        if raw > 1_000_000_000_000:  # milliseconds
+            raw //= 1000
+        # Sanity window: 2010-01-01 .. now + 1 day (ignore garbage matches).
+        if 1_262_304_000 <= raw <= int(time.time()) + 86400:
+            return datetime.fromtimestamp(raw, tz=timezone.utc).isoformat(timespec="milliseconds")
+
+    now = datetime.now(timezone.utc)
+
+    special = _LISTED_SPECIAL_RE.search(html)
+    if special:
+        word = special.group(1).lower()
+        delta = timedelta(days=1) if word == "yesterday" else timedelta(0)
+        return (now - delta).isoformat(timespec="milliseconds")
+
+    ago = _LISTED_AGO_RE.search(html)
+    if ago:
+        qty = 1 if ago.group(1).lower() in ("a", "an") else int(ago.group(1))
+        seconds = qty * _AGO_UNIT_SECONDS[ago.group(2).lower()]
+        return (now - timedelta(seconds=seconds)).isoformat(timespec="milliseconds")
+
+    return None
+
+
+async def enrich_listed_times(page, records, log=print):
+    """
+    Open each newly-found item's detail page and fill in its real `listed_at`.
+
+    `records` are dicts that are also held by the store, so mutating them here
+    updates what gets saved/published. Capped at DETAIL_FETCH_CAP per call to
+    keep the extra navigation bounded. Returns the number of pages fetched.
+    """
+    fetched = 0
+    for rec in records:
+        if fetched >= DETAIL_FETCH_CAP:
+            log(f"   listed-time: reached cap of {DETAIL_FETCH_CAP} item pages this cycle.")
+            break
+        url = rec.get("url")
+        if not url:
+            continue
+        try:
+            await page.goto(url, timeout=45000)
+            await page.wait_for_timeout(random.randint(800, 1600))
+            listed = parse_listed_time(await page.content())
+            if listed:
+                rec["listed_at"] = listed
+        except Exception as e:
+            log(f"   listed-time: skipped {rec.get('id')} ({str(e)[:60]})")
+        fetched += 1
+    return fetched
 
 
 # ----------------------------------------------------------------------------
@@ -228,8 +383,10 @@ def prune_store(store, retention_days=RETENTION_DAYS):
 
 def build_feed_payload(store):
     """Build the JSON string the app consumes, newest first."""
-    listings = [rec for rec in store.values() if rec.get("title")]  # skip migrated id-only stubs
-    listings.sort(key=lambda r: r.get("first_seen", ""), reverse=True)
+    # skip migrated id-only stubs, and re-apply relevance so junk already sitting
+    # in the store (recorded before filtering existed) drops out of the feed too.
+    listings = [rec for rec in store.values() if rec.get("title") and is_relevant(rec)]
+    listings.sort(key=lambda r: r.get("listed_at") or r.get("first_seen", ""), reverse=True)
     payload = {
         "generated_at": _iso_now(),
         "count": len(listings),

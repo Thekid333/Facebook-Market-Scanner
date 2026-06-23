@@ -32,7 +32,10 @@ async def check_marketplace():
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=False,
-            args=["--window-position=2000,100"],
+            args=[
+                "--window-position=2000,100",
+                "--disable-blink-features=AutomationControlled",
+            ],
         )
         if os.path.exists(AUTH_FILE):
             context = await browser.new_context(
@@ -62,13 +65,19 @@ async def check_marketplace():
                 await page.wait_for_timeout(2000)
 
                 soup = BeautifulSoup(await page.content(), "html.parser")
+                new_records = []
                 for link in soup.find_all("a", href=True):
                     record = core.parse_listing(link, search_name)
                     if record is None:
                         continue
                     if core.record_listing(store, record):
                         new_count += 1
+                        new_records.append(record)
                         print(f"  + NEW: {record['title']} ({record['price']}) {record['location']}")
+
+                # Open each new item's page to stamp its real listed time.
+                if new_records:
+                    await core.enrich_listed_times(page, new_records)
 
                 await page.wait_for_timeout(random.randint(3000, 6000))
 

@@ -5,6 +5,7 @@ env/
 
 # Sensitive auth/session data
 fb_auth.json
+fb_profile/
 
 # Runtime data
 seen_couches.json

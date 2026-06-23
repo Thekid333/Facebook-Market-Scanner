@@ -42,7 +42,10 @@ async def run_scraper_cycle(gui_log):
     new_count = 0
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False, args=[BROWSER_POSITION])
+        browser = await p.chromium.launch(
+            headless=False,
+            args=[BROWSER_POSITION, "--disable-blink-features=AutomationControlled"],
+        )
 
         if os.path.exists(AUTH_FILE):
             context = await browser.new_context(
@@ -74,14 +77,20 @@ async def run_scraper_cycle(gui_log):
                 await page.wait_for_timeout(2000)
 
                 soup = BeautifulSoup(await page.content(), "html.parser")
+                new_records = []
                 for link in soup.find_all("a", href=True):
                     record = core.parse_listing(link, search_name)
                     if record is None:
                         continue
                     if core.record_listing(store, record):
                         new_count += 1
+                        new_records.append(record)
                         log_status(f"  + NEW: {record['title']}")
                         gui_log(f"+ {record['title']} ({record['price']})")
+
+                # Open each new item's page to stamp its real listed time.
+                if new_records:
+                    await core.enrich_listed_times(page, new_records, log=log_status)
 
                 await page.wait_for_timeout(random.randint(3000, 6000))
 

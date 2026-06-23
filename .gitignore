@@ -8,6 +8,7 @@ fb_auth.json
 
 # Runtime data
 seen_couches.json
+listings_store.json
 
 # Python cache
 __pycache__/

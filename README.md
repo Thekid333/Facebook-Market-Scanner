@@ -1,6 +1,15 @@
 # FB Marketplace Scraper Bot
 
-A Python bot that monitors Facebook Marketplace for new listings matching your saved searches and instantly emails you a summary when new items appear. Includes both a headless CLI version and a GUI desktop app.
+A Python bot that monitors Facebook Marketplace for new listings matching your saved
+searches and **publishes them to a GitHub Gist** so the companion iOS app (the
+[Appliance Checklist app](../Appliance-Delievery-App)'s **Snipe** tab) can show them
+ranked by recency and distance — no email required. Includes both a headless CLI
+version and a GUI desktop app.
+
+> **New in this version:** email alerts are replaced by Gist publishing, and each
+> listing now captures its **location** and a **first-seen timestamp** so the app can
+> rank by distance and recency. See [`../SNIPE_SETUP.md`](../SNIPE_SETUP.md) for the
+> full end-to-end setup.
 
 ---
 
@@ -8,7 +17,8 @@ A Python bot that monitors Facebook Marketplace for new listings matching your s
 
 - Monitors multiple Marketplace search URLs simultaneously
 - Detects new listings and skips already-seen items (persistent deduplication)
-- Sends a single batch HTML email with item title, price, photo, and a direct link
+- Captures each listing's title, price, **location**, photo, link, and **first-seen time**
+- Publishes the rolling feed to a **GitHub Gist** (`listings.json`) for the iOS app — no email
 - Randomized delays between requests to avoid bot detection
 - Stealth mode via Playwright (hides `webdriver` flag)
 - **GUI version** (`gui_scraper.py`) with a dark-mode on/off toggle and live status display
@@ -20,11 +30,13 @@ A Python bot that monitors Facebook Marketplace for new listings matching your s
 
 ```
 .
+├── marketplace_core.py # Shared parsing + store + Gist publishing logic
 ├── Scraper.py          # Headless CLI scraper (runs continuously)
 ├── gui_scraper.py      # GUI desktop app with on/off toggle
 ├── setup_login.py      # One-time Facebook login session saver
 ├── fb_auth.json        # Saved login session (gitignored — do not commit)
-├── seen_couches.json   # Deduplication database (gitignored)
+├── listings_store.json # Rolling listing store w/ timestamps (gitignored)
+├── .env                # GITHUB_TOKEN + GIST_ID (gitignored)
 └── requirements.txt
 ```
 
@@ -53,17 +65,22 @@ A browser window will open. Log in to Facebook, then press `Enter` in the termin
 
 Open `gui_scraper.py` (or `Scraper.py`) and edit the `SEARCH_URLS` dictionary. Each entry is a name paired with a Facebook Marketplace search URL. Uncomment any of the pre-built examples or paste in your own search URLs.
 
-### 4. Configure email notifications
+### 4. Configure Gist publishing (replaces email)
 
-In the same file, update the email settings:
+Copy `.env.example` to `.env` and add a GitHub token with the **`gist`** scope
+(create one at <https://github.com/settings/tokens>):
 
-```python
-SENDER_EMAIL    = "your_gmail@gmail.com"
-SENDER_PASSWORD = "your_app_password"   # Use a Gmail App Password, not your real password
-RECEIVER_EMAIL  = "where_to_send@gmail.com"
+```
+GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxx
+GIST_ID=                       # leave blank on first run — it will be printed for you
+LISTING_RETENTION_DAYS=7
 ```
 
-> **Important:** Never commit your app password to version control. Consider moving credentials to a `.env` file and loading them with `python-dotenv`.
+On the first run the scraper creates a secret gist and prints its `GIST_ID`; paste that
+back into `.env` (and into the app's Snipe settings). Full walkthrough:
+[`../SNIPE_SETUP.md`](../SNIPE_SETUP.md).
+
+> **Important:** `.env`, `fb_auth.json`, and `listings_store.json` are gitignored — never commit them.
 
 ---
 
@@ -87,15 +104,18 @@ Runs continuously in the terminal with the same polling interval.
 
 1. Playwright launches a Chromium browser using your saved Facebook session.
 2. Each search URL is visited in sequence; the page scrolls to load lazy-loaded listings.
-3. BeautifulSoup parses the page HTML for Marketplace item links.
-4. New item IDs (not in `seen_couches.json`) are collected with their title, price, image, and link.
-5. After all searches complete, one summary email is sent with every new find.
+3. BeautifulSoup parses each card into a record (title, price, location, image, link).
+4. New items are added to `listings_store.json` with a first-seen timestamp; known items keep theirs.
+5. Listings older than `LISTING_RETENTION_DAYS` are pruned, and the whole feed is published to the Gist.
 6. The bot sleeps for a random interval (3–6 minutes) and repeats.
+
+The iOS app then fetches the Gist and ranks everything — see [`../SNIPE_SETUP.md`](../SNIPE_SETUP.md).
 
 ---
 
 ## Security Notes
 
 - `fb_auth.json` contains your Facebook session cookies — **never commit this file.**
-- Store email credentials in environment variables or a `.env` file rather than hardcoding them in source.
-- If you accidentally commit credentials, revoke them immediately and generate new ones.
+- Keep your `GITHUB_TOKEN` in `.env` (gitignored), never hardcoded in source.
+- The published gist is *secret* (unlisted), but anyone with its URL can read it — keep the URL private.
+- If you accidentally commit a token, revoke it immediately and generate a new one.

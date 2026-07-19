@@ -1,34 +1,24 @@
-import customtkinter as ctk
-import threading
+"""
+gui_scraper.py
+--------------
+Desktop GUI entry point: an on/off toggle around the same scan cycle the CLI
+runs, with a live status label and log box.
+
+The searches and all scan logic live in scanner.py (shared with the CLI).
+"""
+
 import asyncio
-import os
 import random
+import threading
 import time
 
-from playwright.async_api import async_playwright
-from bs4 import BeautifulSoup
+import customtkinter as ctk
 
 import marketplace_core as core
+import scanner
 
-# ==========================================
-#              CONFIGURATION
-# ==========================================
-
-# --- MONITOR POSITION ---
-# Change these numbers to move the browser!
-# 2000,100 = Right Monitor   |   -1500,100 = Left Monitor   |   100,100 = Main
-BROWSER_POSITION = "--window-position=2000,100"
-
-# Friendly name -> Facebook Marketplace search URL.
-SEARCH_URLS = {
-    "Washer and Dryer": "https://www.facebook.com/marketplace/112825518732186/search?sortBy=distance_ascend&query=Washer%20and%20Dryer&exact=false",
-    "Washer and Dryer (newest)": "https://www.facebook.com/marketplace/112825518732186/search?minPrice=0&deliveryMethod=local_pick_up&sortBy=creation_time_descend&query=Washer%20and%20Dryer&exact=false",
-}
-
-AUTH_FILE = "fb_auth.json"
-
-# Global Control Flags
-IS_RUNNING = False
+# Set by the GUI toggle; the background thread scans only while this is set.
+run_flag = threading.Event()
 
 
 def log_status(msg):
@@ -36,72 +26,19 @@ def log_status(msg):
 
 
 async def run_scraper_cycle(gui_log):
-    """Runs ONE complete pass through all URLs, then publishes to the Gist."""
+    """Runs ONE complete pass through all searches, then publishes to the Gist."""
     log_status("Starting Batch Scan...")
     store = core.load_store()
-    new_count = 0
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=False,
-            args=[BROWSER_POSITION, "--disable-blink-features=AutomationControlled"],
-        )
+    new_count = await scanner.run_scan_cycle(
+        store,
+        log=log_status,
+        on_new=lambda record: gui_log(f"+ {record['title']} ({record['price']})"),
+        should_continue=run_flag.is_set,
+    )
 
-        if os.path.exists(AUTH_FILE):
-            context = await browser.new_context(
-                storage_state=AUTH_FILE, viewport={"width": 1280, "height": 800}
-            )
-        else:
-            context = await browser.new_context()
-
-        page = await context.new_page()
-        await page.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        )
-
-        for search_name, url in SEARCH_URLS.items():
-            if not IS_RUNNING:
-                log_status("Stop signal received. Aborting current batch.")
-                break
-
-            log_status(f"Scanning: {search_name}...")
-            try:
-                await page.goto(url, timeout=60000)
-                try:
-                    await page.keyboard.press("Escape")
-                except Exception:
-                    pass
-
-                await page.wait_for_timeout(random.randint(2000, 4000))
-                await page.mouse.wheel(0, 1500)
-                await page.wait_for_timeout(2000)
-
-                soup = BeautifulSoup(await page.content(), "html.parser")
-                new_records = []
-                for link in soup.find_all("a", href=True):
-                    record = core.parse_listing(link, search_name)
-                    if record is None:
-                        continue
-                    if core.record_listing(store, record):
-                        new_count += 1
-                        new_records.append(record)
-                        log_status(f"  + NEW: {record['title']}")
-                        gui_log(f"+ {record['title']} ({record['price']})")
-
-                # Open each new item's page to stamp its real listed time.
-                if new_records:
-                    await core.enrich_listed_times(page, new_records, log=log_status)
-
-                await page.wait_for_timeout(random.randint(3000, 6000))
-
-            except Exception as e:
-                log_status(f"Error scanning {search_name}: {e}")
-                continue
-
-        await browser.close()
-
-    # Publish the full feed to the Gist (replaces the old email step).
-    if IS_RUNNING:
+    # Publish the full feed to the Gist unless the user hit stop mid-batch.
+    if run_flag.is_set():
         core.publish_store(store, log=lambda m: (log_status(m), gui_log(m)))
     log_status(f"Batch Scan Complete. {new_count} new this pass.")
 
@@ -109,24 +46,26 @@ async def run_scraper_cycle(gui_log):
 def background_loop(status_callback, gui_log):
     """The infinite loop that runs in the background thread."""
     while True:
-        if IS_RUNNING:
-            try:
-                status_callback("Scanning...")
-                asyncio.run(run_scraper_cycle(gui_log))
-
-                if IS_RUNNING:
-                    sleep_time = random.randint(180, 360)
-                    status_callback(f"Sleeping {sleep_time}s...")
-                    for _ in range(sleep_time):
-                        if not IS_RUNNING:
-                            break
-                        time.sleep(1)
-            except Exception as e:
-                status_callback(f"Error: {str(e)[:30]}...")
-                log_status(f"Critical Error: {e}")
-                time.sleep(10)
-        else:
+        if not run_flag.is_set():
             time.sleep(1)
+            continue
+
+        try:
+            status_callback("Scanning...")
+            asyncio.run(run_scraper_cycle(gui_log))
+
+            if run_flag.is_set():
+                sleep_time = random.randint(*scanner.CYCLE_SLEEP_RANGE)
+                status_callback(f"Sleeping {sleep_time}s...")
+                # Sleep in 1s slices so the stop switch reacts quickly.
+                for _ in range(sleep_time):
+                    if not run_flag.is_set():
+                        break
+                    time.sleep(1)
+        except Exception as e:
+            status_callback(f"Error: {str(e)[:30]}...")
+            log_status(f"Critical Error: {e}")
+            time.sleep(10)
 
 
 # ==========================================
@@ -178,14 +117,13 @@ class ScraperApp(ctk.CTk):
         self.after(0, _append)
 
     def toggle_switch(self):
-        global IS_RUNNING
         if self.switch_var.get() == "on":
-            IS_RUNNING = True
+            run_flag.set()
             self.switch.configure(text="Scraper ON")
             self.status_label.configure(text_color="green")
             self.gui_log(">> Starting...")
         else:
-            IS_RUNNING = False
+            run_flag.clear()
             self.switch.configure(text="Scraper OFF")
             self.status_label.configure(text_color="red", text="Status: Stopping (wait for scan)...")
             self.gui_log(">> Stopping...")

@@ -354,9 +354,13 @@ def record_listing(store, record):
     """
     item_id = record["id"]
     if item_id in store:
-        # Already known: refresh mutable fields but keep the original first_seen.
+        # Already known: refresh mutable fields but keep the original first_seen
+        # and the enriched listed_at — search cards never carry the posted time,
+        # so without this it would be wiped on every subsequent scan cycle.
         existing = store[item_id]
         record["first_seen"] = existing.get("first_seen", _iso_now())
+        if "listed_at" not in record and "listed_at" in existing:
+            record["listed_at"] = existing["listed_at"]
         store[item_id] = record
         return False
 

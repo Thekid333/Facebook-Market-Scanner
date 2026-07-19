@@ -31,9 +31,11 @@ version and a GUI desktop app.
 ```
 .
 ├── marketplace_core.py # Shared parsing + store + Gist publishing logic
-├── Scraper.py          # Headless CLI scraper (runs continuously)
-├── gui_scraper.py      # GUI desktop app with on/off toggle
+├── scanner.py          # Shared Playwright scan cycle + SEARCH_URLS config
+├── Scraper.py          # CLI entry point (runs continuously in the terminal)
+├── gui_scraper.py      # GUI entry point with on/off toggle
 ├── setup_login.py      # One-time Facebook login session saver
+├── import_cookies.py   # Alternative: build fb_auth.json from browser cookies
 ├── fb_auth.json        # Saved login session (gitignored — do not commit)
 ├── listings_store.json # Rolling listing store w/ timestamps (gitignored)
 ├── .env                # GITHUB_TOKEN + GIST_ID (gitignored)
@@ -63,7 +65,7 @@ A browser window will open. Log in to Facebook, then press `Enter` in the termin
 
 ### 3. Configure your searches
 
-Open `gui_scraper.py` (or `Scraper.py`) and edit the `SEARCH_URLS` dictionary. Each entry is a name paired with a Facebook Marketplace search URL. Uncomment any of the pre-built examples or paste in your own search URLs.
+Open `scanner.py` and edit the `SEARCH_URLS` dictionary. Each entry is a name paired with a Facebook Marketplace search URL — both the CLI and the GUI read this one dictionary. Uncomment any of the pre-built examples or paste in your own search URLs.
 
 ### 4. Configure Gist publishing (replaces email)
 

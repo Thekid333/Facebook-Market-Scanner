@@ -18,10 +18,10 @@ import scanner
 async def run_one_cycle():
     print(f"--- Starting Batch Scan at {time.strftime('%H:%M:%S')} ---")
     store = core.load_store()
-    new_count = await scanner.run_scan_cycle(store)
-    print(f"Cycle complete. {new_count} new listing(s) this pass.")
-    # Prune, save, and publish the whole feed to the Gist.
-    core.publish_store(store)
+    new_count, healed = await scanner.run_scan_cycle(store)
+    print(f"Cycle complete. {new_count} new listing(s), {healed} listed-time(s) healed.")
+    # Prune, save, and publish the whole feed to the Gist (skipped if unchanged).
+    core.publish_store(store, changed=bool(new_count or healed))
 
 
 if __name__ == "__main__":

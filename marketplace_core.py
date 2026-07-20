@@ -518,11 +518,20 @@ def publish_to_gist(payload_json, log=print):
         return None
 
 
-def publish_store(store, log=print):
-    """Convenience: prune, save, and publish the store in one call."""
+def publish_store(store, log=print, changed=True):
+    """
+    Prune, save, and (when warranted) publish the store in one call.
+
+    Pass changed=False when the scan cycle found nothing new — the store is
+    still saved, but the gist publish is skipped so the feed's ETag stays
+    stable and the app's conditional fetches keep getting free 304s.
+    """
     removed = prune_store(store)
     if removed:
         log(f"Pruned {removed} listing(s) older than {RETENTION_DAYS} days.")
     save_store(store)
+    if not (changed or removed):
+        log("No feed changes this cycle — skipping gist publish.")
+        return None
     payload = build_feed_payload(store)
     return publish_to_gist(payload, log=log)

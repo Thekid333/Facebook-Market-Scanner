@@ -55,10 +55,13 @@ async def run_scan_cycle(store, log=print, on_new=None, should_continue=None):
     - `should_continue`: optional zero-arg callable checked between searches so a
       GUI stop switch can abort the rest of the batch.
 
-    Returns the number of new listings found this pass. The caller is
-    responsible for publishing the store afterwards (core.publish_store).
+    Returns `(new_count, healed)`: new listings found, and stored listings whose
+    real listed_at was backfilled. The caller publishes the store afterwards —
+    pass `changed=bool(new_count or healed)` to core.publish_store so unchanged
+    cycles skip the gist PATCH and keep the feed's ETag stable.
     """
     new_count = 0
+    healed = 0
     # One shared budget of item-page fetches per cycle: new listings first,
     # whatever is left goes to backfilling older records missing listed_at.
     detail_budget = core.DETAIL_FETCH_CAP
@@ -137,7 +140,8 @@ async def run_scan_cycle(store, log=print, on_new=None, should_continue=None):
             if backlog:
                 log(f"Backfilling listed times: {min(len(backlog), detail_budget)} of {len(backlog)} pending...")
                 await core.enrich_listed_times(page, backlog, log=log, limit=detail_budget)
+                healed = sum(1 for rec in backlog if rec.get("listed_at"))
 
         await browser.close()
 
-    return new_count
+    return new_count, healed

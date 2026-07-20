@@ -30,16 +30,20 @@ async def run_scraper_cycle(gui_log):
     log_status("Starting Batch Scan...")
     store = core.load_store()
 
-    new_count = await scanner.run_scan_cycle(
+    new_count, healed = await scanner.run_scan_cycle(
         store,
         log=log_status,
         on_new=lambda record: gui_log(f"+ {record['title']} ({record['price']})"),
         should_continue=run_flag.is_set,
     )
 
-    # Publish the full feed to the Gist unless the user hit stop mid-batch.
-    if run_flag.is_set():
-        core.publish_store(store, log=lambda m: (log_status(m), gui_log(m)))
+    # Always save/publish — even when stopped mid-batch, anything found before
+    # the stop would otherwise be lost and re-scraped as "new" next time.
+    core.publish_store(
+        store,
+        log=lambda m: (log_status(m), gui_log(m)),
+        changed=bool(new_count or healed),
+    )
     log_status(f"Batch Scan Complete. {new_count} new this pass.")
 
 

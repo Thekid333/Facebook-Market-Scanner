@@ -69,6 +69,11 @@ QUERY_STOPWORDS = {"and", "or", "the", "a", "with", "for", "of", "in", "set", "&
 # extra navigation (and bot-detection risk) bounded on a big first batch.
 DETAIL_FETCH_CAP = int(os.getenv("LISTING_DETAIL_FETCH_CAP", "15"))
 
+# Give up on a listing's detail page after this many failed parse attempts —
+# FB markup varies, and endless retries would burn the whole fetch budget on
+# the same unparseable pages every cycle.
+MAX_LISTED_AT_ATTEMPTS = 3
+
 # GitHub Gist publishing (the free "view anywhere" bridge to the app)
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
 GIST_ID = os.getenv("GIST_ID", "").strip()
@@ -280,18 +285,37 @@ def parse_listed_time(html):
     return None
 
 
-async def enrich_listed_times(page, records, log=print):
+def records_missing_listed_at(store):
     """
-    Open each newly-found item's detail page and fill in its real `listed_at`.
+    Store records that still need a listed_at backfill: real listings (not
+    migrated id-only stubs) with a url, no listed_at yet, and retry attempts
+    left. Newest first, so the freshest items heal first.
+    """
+    candidates = [
+        rec for rec in store.values()
+        if rec.get("title") and rec.get("url") and not rec.get("listed_at")
+        and rec.get("listed_at_attempts", 0) < MAX_LISTED_AT_ATTEMPTS
+    ]
+    candidates.sort(key=lambda r: r.get("first_seen", ""), reverse=True)
+    return candidates
+
+
+async def enrich_listed_times(page, records, log=print, limit=None):
+    """
+    Open each item's detail page and fill in its real `listed_at`.
 
     `records` are dicts that are also held by the store, so mutating them here
-    updates what gets saved/published. Capped at DETAIL_FETCH_CAP per call to
-    keep the extra navigation bounded. Returns the number of pages fetched.
+    updates what gets saved/published. At most `limit` pages are opened
+    (default DETAIL_FETCH_CAP) to keep the extra navigation bounded. A page
+    that yields no parseable time bumps the record's `listed_at_attempts`;
+    after MAX_LISTED_AT_ATTEMPTS the record is left on first_seen for good.
+    Returns the number of pages fetched.
     """
+    cap = DETAIL_FETCH_CAP if limit is None else limit
     fetched = 0
     for rec in records:
-        if fetched >= DETAIL_FETCH_CAP:
-            log(f"   listed-time: reached cap of {DETAIL_FETCH_CAP} item pages this cycle.")
+        if fetched >= cap:
+            log(f"   listed-time: reached cap of {cap} item pages this cycle.")
             break
         url = rec.get("url")
         if not url:
@@ -302,8 +326,12 @@ async def enrich_listed_times(page, records, log=print):
             listed = parse_listed_time(await page.content())
             if listed:
                 rec["listed_at"] = listed
+                rec.pop("listed_at_attempts", None)
+            else:
+                rec["listed_at_attempts"] = rec.get("listed_at_attempts", 0) + 1
         except Exception as e:
             log(f"   listed-time: skipped {rec.get('id')} ({str(e)[:60]})")
+            rec["listed_at_attempts"] = rec.get("listed_at_attempts", 0) + 1
         fetched += 1
     return fetched
 
@@ -361,6 +389,9 @@ def record_listing(store, record):
         record["first_seen"] = existing.get("first_seen", _iso_now())
         if "listed_at" not in record and "listed_at" in existing:
             record["listed_at"] = existing["listed_at"]
+        # Keep the failed-parse counter too, so backfill retries stay bounded.
+        if "listed_at_attempts" not in record and "listed_at_attempts" in existing:
+            record["listed_at_attempts"] = existing["listed_at_attempts"]
         store[item_id] = record
         return False
 

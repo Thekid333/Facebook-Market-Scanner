@@ -59,6 +59,10 @@ async def run_scan_cycle(store, log=print, on_new=None, should_continue=None):
     responsible for publishing the store afterwards (core.publish_store).
     """
     new_count = 0
+    # One shared budget of item-page fetches per cycle: new listings first,
+    # whatever is left goes to backfilling older records missing listed_at.
+    detail_budget = core.DETAIL_FETCH_CAP
+    attempted_ids = set()
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -110,14 +114,29 @@ async def run_scan_cycle(store, log=print, on_new=None, should_continue=None):
                             on_new(record)
 
                 # Open each new item's page to stamp its real listed time.
-                if new_records:
-                    await core.enrich_listed_times(page, new_records, log=log)
+                if new_records and detail_budget > 0:
+                    detail_budget -= await core.enrich_listed_times(
+                        page, new_records, log=log, limit=detail_budget
+                    )
+                    attempted_ids.update(r["id"] for r in new_records)
 
                 await page.wait_for_timeout(random.randint(3000, 6000))
 
             except Exception as e:
                 log(f"Error scanning {search_name}: {e}")
                 continue
+
+        # Heal older store records that still lack a listed_at (recorded before
+        # enrichment existed, or wiped by the pre-fix bug, or failed to parse
+        # last time) with whatever fetch budget this cycle has left.
+        if detail_budget > 0 and (should_continue is None or should_continue()):
+            backlog = [
+                rec for rec in core.records_missing_listed_at(store)
+                if rec["id"] not in attempted_ids
+            ]
+            if backlog:
+                log(f"Backfilling listed times: {min(len(backlog), detail_budget)} of {len(backlog)} pending...")
+                await core.enrich_listed_times(page, backlog, log=log, limit=detail_budget)
 
         await browser.close()
 
